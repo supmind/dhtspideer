@@ -182,16 +182,7 @@ class ElasticsearchLoader:
                     else:
                         logger.warning(f"[{infohash_hex}] 'creation date' 时间戳 {creation_timestamp} 为负数，已忽略。")
 
-            doc['comment'] = parsed_metainfo.get(b'comment', b'').decode('utf-8', 'ignore')
-            doc['created_by'] = parsed_metainfo.get(b'created by', b'').decode('utf-8', 'ignore')
             doc['encoding'] = parsed_metainfo.get(b'encoding', b'').decode('utf-8', 'ignore')
-            
-            announce_url = parsed_metainfo.get(b'announce')
-            if announce_url: # Check if it exists first
-                 if isinstance(announce_url, bytes):
-                    doc['announce'] = announce_url.decode('utf-8', 'ignore')
-                 else:
-                    logger.warning(f"[{infohash_hex}] 'announce' URL 类型不正确: {type(announce_url)}。已忽略。")
             
             announce_list_raw = parsed_metainfo.get(b'announce-list')
             if isinstance(announce_list_raw, list):
@@ -202,10 +193,6 @@ class ElasticsearchLoader:
                             if isinstance(url_bytes, bytes):
                                 doc['announce_list'].append({'url': url_bytes.decode('utf-8', 'ignore')})
             
-            private_flag = info_dict.get(b'private')
-            if isinstance(private_flag, int):
-                doc['private'] = bool(private_flag)
-
             source_val = info_dict.get(b'source')
             if isinstance(source_val, bytes):
                  doc['source'] = source_val.decode('utf-8', 'ignore')

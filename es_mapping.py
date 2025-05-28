@@ -18,12 +18,8 @@ class TorrentMetainfo(Document):
     files = Nested(File)  # Optional, for multi-file torrents
     length = Long()  # Optional, for single-file torrents
     creation_date = Date()  # Optional
-    comment = Text(analyzer='ik_smart')  # Optional
-    created_by = Text(analyzer='ik_smart')  # Optional
     encoding = Keyword()  # Optional
-    announce = Keyword()  # Optional
     announce_list = Nested(AnnounceURL)  # Optional
-    private = Boolean()  # Optional
     source = Text(analyzer='ik_smart')  # Optional
 
     class Index:
