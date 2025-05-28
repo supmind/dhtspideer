@@ -78,6 +78,9 @@ class ElasticsearchLoader:
         es_host = current_es_config["host"]
         es_port = current_es_config["port"]
         
+        self.simulate_es_write = current_es_config.get("simulate_es_write", False) # Default to False
+        logger.info(f"Elasticsearch simulate_es_write mode: {self.simulate_es_write}")
+
         self.connection_string = f"{es_scheme}://{es_host}:{es_port}" # 存储连接字符串以供日志记录 (Store connection string for logging)
         try:
             # 根据 Elasticsearch 客户端版本，ping 方法可能是异步的
@@ -206,7 +209,8 @@ class ElasticsearchLoader:
 
     def store_metainfo(self, infohash_input: str | bytes, metainfo_bytes: bytes) -> bool:
         """
-        存储单个种子元信息到 Elasticsearch。
+        存储单个种子元信息到 Elasticsearch，或根据配置模拟写入。
+        (Store a single torrent metainfo into Elasticsearch, or simulate write based on configuration.)
         (Store a single torrent metainfo into Elasticsearch.)
         Args:
             infohash_input (str | bytes): Infohash，可以是十六进制字符串或字节串。
@@ -241,6 +245,10 @@ class ElasticsearchLoader:
         if not document_to_store:
             logger.error(f"[{infohash_hex}] 无法准备文档，存储中止。 (Failed to prepare document for {infohash_hex}, storage aborted.)")
             return False
+
+        if self.simulate_es_write:
+            logger.info(f"[{infohash_hex}] SIMULATING Elasticsearch write. Document: {document_to_store}")
+            return True # Indicate success for simulation
 
         try:
             response = self.es.index(

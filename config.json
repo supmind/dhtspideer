@@ -2,7 +2,8 @@
   "elasticsearch": {
     "host": "localhost",
     "port": 9200,
-    "scheme": "http"
+    "scheme": "http",
+    "simulate_es_write": false
   },
   "crawler": {
     "max_concurrent_downloads": 10,

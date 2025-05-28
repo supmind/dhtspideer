@@ -117,7 +117,13 @@ def load_main_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict: # 重命�
         },
         "logging": {
             "level": "INFO",
-            "file_path": None 
+            "file_path": None
+        },
+        "elasticsearch": {
+            "host": "localhost",
+            "port": 9200,
+            "scheme": "http",
+            "simulate_es_write": False
         }
     }
     try:
@@ -126,7 +132,7 @@ def load_main_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict: # 重命�
             
             user_crawler_cfg = config.get("crawler", {})
             user_logging_cfg = config.get("logging", {})
-            user_es_cfg = config.get("elasticsearch", {}) # ES config checked later in main()
+            user_es_cfg = config.get("elasticsearch", {})
 
             if not isinstance(user_crawler_cfg, dict):
                 logger.warning("配置中的 'crawler' 部分不是一个字典对象，将仅使用默认爬虫配置。 (Configuration section 'crawler' is not a dictionary, using default crawler configurations only.)")
@@ -134,23 +140,29 @@ def load_main_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict: # 重命�
             if not isinstance(user_logging_cfg, dict):
                 logger.warning("配置中的 'logging' 部分不是一个字典对象，将仅使用默认日志配置。 (Configuration section 'logging' is not a dictionary, using default logging configurations only.)")
                 user_logging_cfg = {}
+            if not isinstance(user_es_cfg, dict):
+                logger.warning("配置中的 'elasticsearch' 部分不是一个字典对象，将仅使用默认 ES 配置。 (Configuration section 'elasticsearch' is not a dictionary, using default ES configurations only.)")
+                user_es_cfg = {}
 
             crawler_cfg = {**default_cfg["crawler"], **user_crawler_cfg}
             logging_cfg = {**default_cfg["logging"], **user_logging_cfg}
+            es_cfg = {**default_cfg["elasticsearch"], **user_es_cfg} # Merge defaults with user config
             
-            final_config = {"crawler": crawler_cfg, "logging": logging_cfg, "elasticsearch": user_es_cfg}
+            final_config = {"crawler": crawler_cfg, "logging": logging_cfg, "elasticsearch": es_cfg}
             logger.info(f"成功从 '{config_path}' 加载配置: {final_config} "
                         f"(Successfully loaded configuration from '{config_path}': {final_config})")
             return final_config
     except FileNotFoundError:
-        logger.warning(f"配置文件 '{config_path}' 未找到。使用所有默认值。 "
-                       f"(Configuration file '{config_path}' not found. Using all default values.)")
+        logger.warning(f"配置文件 '{config_path}' 未找到。使用完整的默认配置。 "
+                       f"(Configuration file '{config_path}' not found. Using full default configurations.)")
     except json.JSONDecodeError:
-        logger.warning(f"解析配置文件 '{config_path}' 时出错。使用所有默认值。 "
-                       f"(Error parsing configuration file '{config_path}'. Using all default values.)")
+        logger.warning(f"解析配置文件 '{config_path}' 时出错。使用完整的默认配置。 "
+                       f"(Error parsing configuration file '{config_path}'. Using full default configurations.)")
     except Exception as e:
-        logger.error(f"加载配置文件 '{config_path}' 时发生未知错误: {e}。使用所有默认值。 "
-                     f"(An unknown error occurred while loading configuration file '{config_path}': {e}. Using all default values.)")
+        logger.error(f"加载配置文件 '{config_path}' 时发生未知错误: {e}。使用完整的默认配置。 "
+                     f"(An unknown error occurred while loading configuration file '{config_path}': {e}. Using full default configurations.)")
+    # If any error occurs or file not found, return the comprehensive default_cfg
+    logger.info(f"返回默认配置: {default_cfg} (Returning default configuration: {default_cfg})")
     return default_cfg
 
 
