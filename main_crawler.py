@@ -1,0 +1,827 @@
+import asyncio
+import signal
+import logging
+import hashlib
+import os # 用于生成 peer_id (For generating peer_id)
+import binascii # 用于 infohash 的十六进制转换 (For hex conversion of infohash)
+import json # 用于加载配置 (For loading configuration)
+import time # 用于定期日志记录 (For periodic logging)
+
+from dht_crawler import DHTCrawler
+from metainfo_downloader import MetainfoDownloader
+from es_loader import ElasticsearchLoader, load_es_config, DEFAULT_CONFIG_PATH
+
+# --- 日志配置开始 (Logging Configuration Start) ---
+# 默认日志格式 (Default log format)
+DEFAULT_LOG_FORMAT = '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
+# 获取根日志记录器 (Get the root logger)
+# 注意：在这里获取 logger 实例，以便在配置函数之前就可以使用它
+# (Note: Get the logger instance here so it can be used even before the config function)
+logger = logging.getLogger(__name__) # 获取此模块的日志记录器 (Get logger for this module)
+
+# 指标计数器 (Metric Counters)
+metrics = {
+    "infohashes_discovered_total": 0,
+    "metainfo_downloaded_success_total": 0,
+    "metainfo_downloaded_failure_total": 0,
+    "metainfo_stored_es_total": 0,
+    "active_download_tasks": 0 # 当前活动的下载任务数 (Current number of active download tasks)
+}
+# 上次记录指标的时间 (Time when metrics were last logged)
+last_metrics_log_time = time.monotonic()
+# 指标记录间隔（秒）(Metrics logging interval in seconds)
+METRICS_LOG_INTERVAL = 60 
+
+
+def setup_logging(log_level_str: str = "INFO", log_file: str | None = None, log_format: str = DEFAULT_LOG_FORMAT):
+    """
+    配置根日志记录器。
+    (Configure the root logger.)
+    Args:
+        log_level_str (str): 日志级别字符串 (e.g., "DEBUG", "INFO").
+                             (Log level string (e.g., "DEBUG", "INFO").)
+        log_file (str | None): 可选的日志文件路径。如果提供，日志将写入此文件。
+                               (Optional path to a log file. If provided, logs will be written to this file.)
+        log_format (str): 日志消息的格式。
+                          (Format for log messages.)
+    """
+    # 将日志级别字符串转换为 logging 模块的常量 (Convert log level string to logging module constant)
+    numeric_level = getattr(logging, log_level_str.upper(), logging.INFO)
+    
+    # 获取根日志记录器 (Get the root logger)
+    # 在 Python 3.8+ 中，logging.basicConfig 可以多次调用，但 force=True 是必需的
+    # (In Python 3.8+, logging.basicConfig can be called multiple times, but force=True is necessary)
+    # 为了更广泛的兼容性和控制，我们将手动添加处理器
+    # (For broader compatibility and control, we will manually add handlers)
+    
+    root_logger = logging.getLogger() # 获取根日志记录器 (Get the root logger)
+    root_logger.setLevel(numeric_level) # 设置根日志级别 (Set the root log level)
+    
+    # 清除任何现有的处理器，以避免重复日志 (Clear any existing handlers to avoid duplicate logs)
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+        handler.close()
+
+    # 创建格式化器 (Create formatter)
+    formatter = logging.Formatter(log_format)
+
+    # 添加流处理器 (控制台) (Add Stream Handler (console))
+    # 这将确保日志至少输出到控制台 (This ensures logs are at least output to console)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root_logger.addHandler(stream_handler) # 将流处理器添加到根日志记录器 (Add stream handler to root logger)
+    logger.info(f"控制台日志级别设置为: {log_level_str} (Console logging level set to: {log_level_str})")
+
+    # 如果提供了日志文件路径，则添加文件处理器 (If log file path is provided, add File Handler)
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8') # 以追加模式打开文件 (Open file in append mode)
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler) # 将文件处理器添加到根日志记录器 (Add file handler to root logger)
+            logger.info(f"文件日志级别设置为: {log_level_str}, 日志文件: {log_file} "
+                        f"(File logging level set to: {log_level_str}, log file: {log_file})")
+        except Exception as e:
+            # 文件处理器设置失败错误处理 (File handler setup failure error handling)
+            logger.error(f"设置文件日志处理器 '{log_file}' 失败: {e} "
+                         f"(Failed to set up file log handler '{log_file}': {e})")
+# --- 日志配置结束 (Logging Configuration End) ---
+
+
+# 全局变量，用于信号处理 (Global variable for signal handling)
+shutdown_event = asyncio.Event() # 创建一个异步事件对象，用于通知关闭 (Create an async event object to signal shutdown)
+
+# 客户端标识和版本 (Client identifier and version)
+CLIENT_NAME = "MyCr" # 保持简短 (Keep it short)
+CLIENT_VERSION = "0001" # 4 个字符 (4 characters)
+
+def generate_peer_id() -> bytes:
+    """
+    生成一个符合 BitTorrent 规范的 peer_id。
+    通常是 20 字节，前缀为客户端标识。
+    (Generate a peer_id compliant with BitTorrent specifications.
+    Typically 20 bytes, prefixed with a client identifier.)
+    Returns:
+        bytes: 20 字节的 peer_id。 (20-byte peer_id.)
+    """
+    client_prefix = f"-{CLIENT_NAME[:2].upper()}{CLIENT_VERSION}-" 
+    random_bytes_len = 20 - len(client_prefix)
+    random_bytes = os.urandom(random_bytes_len) 
+    peer_id = client_prefix.encode('ascii') + random_bytes 
+    logger.info(f"生成的 peer_id (Latin-1): {peer_id.decode('latin-1')} (十六进制: {binascii.hexlify(peer_id).decode()}) "
+                f"(Generated peer_id (Latin-1): {peer_id.decode('latin-1')} (hex: {binascii.hexlify(peer_id).decode()}))")
+    return peer_id
+
+def load_crawler_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
+    """
+    加载爬虫特定的配置 (例如并发设置)。
+    (Load crawler-specific configurations (e.g., concurrency settings).)
+    Args:
+        config_path (str): 配置文件的路径。 (Path to the configuration file.)
+    Returns:
+        dict: 包含爬虫配置和日志配置的字典。 (Dictionary containing crawler and logging configurations.)
+    """
+    # 默认配置 (Default configurations)
+    default_cfg = {
+        "crawler": {
+            "max_concurrent_downloads": 5,
+            "max_peers_per_infohash": 30,
+            "dht_port": 6881
+        },
+        "logging": {
+            "level": "INFO",
+            "file_path": None # 默认不记录到文件 (Default no logging to file)
+        }
+    }
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f) 
+            # 合并用户配置和默认配置 (Merge user config with default config)
+            # 用户配置会覆盖默认值 (User config will override defaults)
+            crawler_cfg = {**default_cfg["crawler"], **config.get("crawler", {})}
+            logging_cfg = {**default_cfg["logging"], **config.get("logging", {})}
+            
+            final_config = {"crawler": crawler_cfg, "logging": logging_cfg}
+            logger.info(f"成功从 '{config_path}' 加载配置: {final_config} "
+                        f"(Successfully loaded configuration from '{config_path}': {final_config})")
+            return final_config
+    except FileNotFoundError:
+        logger.warning(f"配置文件 '{config_path}' 未找到。使用所有默认值。 "
+                       f"(Configuration file '{config_path}' not found. Using all default values.)")
+    except json.JSONDecodeError:
+        logger.warning(f"解析配置文件 '{config_path}' 时出错。使用所有默认值。 "
+                       f"(Error parsing configuration file '{config_path}'. Using all default values.)")
+    except Exception as e:
+        logger.error(f"加载配置文件 '{config_path}' 时发生未知错误: {e}。使用所有默认值。 "
+                     f"(An unknown error occurred while loading configuration file '{config_path}': {e}. Using all default values.)")
+    # 如果加载失败，返回包含所有默认值的字典 (If loading fails, return a dictionary with all default values)
+    return default_cfg
+
+
+async def log_metrics_periodically():
+    """
+    定期记录收集的指标。
+    (Periodically log collected metrics.)
+    """
+    global last_metrics_log_time
+    while not shutdown_event.is_set(): # 循环直到关闭事件被设置 (Loop until shutdown event is set)
+        await asyncio.sleep(METRICS_LOG_INTERVAL) # 等待指定的间隔 (Wait for the specified interval)
+        # 确保在关闭期间不会尝试记录指标 (Ensure metrics are not logged during shutdown)
+        if shutdown_event.is_set():
+            break
+        
+        # 计算自上次记录以来的时间 (Calculate time since last logging)
+        current_time = time.monotonic()
+        time_elapsed = current_time - last_metrics_log_time
+        
+        # 准备指标日志消息 (Prepare metrics log message)
+        # 创建 metrics 字典的副本以进行安全迭代 (Create a copy of metrics dict for safe iteration)
+        current_metrics_snapshot = metrics.copy()
+        metrics_log_message = ", ".join(f"{key}={value}" for key, value in current_metrics_snapshot.items())
+        
+        logger.info(f"爬虫指标 (过去 {time_elapsed:.2f} 秒): {metrics_log_message} "
+                    f"(Crawler Metrics (last {time_elapsed:.2f}s): {metrics_log_message})")
+        last_metrics_log_time = current_time # 更新上次记录时间 (Update last log time)
+
+async def process_infohash_task(
+    infohash_bytes: bytes,
+    dht_crawler: DHTCrawler,
+    downloader_peer_id: bytes, 
+    es_loader: ElasticsearchLoader,
+    semaphore: asyncio.Semaphore,
+    max_peers: int
+):
+    """
+    处理单个 infohash 的异步任务：发现对等节点，下载元信息，并存储到 Elasticsearch。
+    (Asynchronous task to process a single infohash: discover peers, download metainfo, and store in Elasticsearch.)
+    """
+    global metrics # 引用全局指标字典 (Reference global metrics dictionary)
+    infohash_hex = binascii.hexlify(infohash_bytes).decode('utf-8') 
+    metainfo_downloader_session = MetainfoDownloader(infohash=infohash_bytes, peer_id=downloader_peer_id)
+
+    async with semaphore: 
+        metrics["active_download_tasks"] += 1 # 增加活动任务计数 (Increment active task count)
+        try:
+            if shutdown_event.is_set(): 
+                logger.info(f"关闭事件已设置，跳过处理 infohash: {infohash_hex} "
+                            f"(Shutdown event is set, skipping processing for infohash: {infohash_hex})")
+                return
+
+            logger.info(f"开始处理 infohash: {infohash_hex} (当前活动任务: {metrics['active_download_tasks']}) "
+                        f"(Starting processing for infohash: {infohash_hex} (current active tasks: {metrics['active_download_tasks']}))")
+            
+            logger.debug(f"[{infohash_hex}] 正在发现对等节点... (Discovering peers...)")
+            peers = await dht_crawler.get_peers_for_infohash(infohash_bytes, max_peers)
+            if not peers:
+                logger.info(f"[{infohash_hex}] 未找到对等节点。 (No peers found.)")
+                metrics["metainfo_downloaded_failure_total"] += 1 # 因未找到对等节点而下载失败 (Download failed due to no peers found)
+                return
+            logger.info(f"[{infohash_hex}] 找到 {len(peers)} 个对等节点。 (Found {len(peers)} peers.)")
+
+            logger.info(f"[{infohash_hex}] 正在下载元信息... (Downloading metainfo...)") # 修改日志级别为 INFO (Changed log level to INFO)
+            metadata_bytes = await metainfo_downloader_session.download(peers) 
+
+            if not metadata_bytes:
+                logger.info(f"[{infohash_hex}] 元信息下载失败。 (Failed to download metainfo.)")
+                metrics["metainfo_downloaded_failure_total"] += 1 # 下载失败计数 (Increment download failure count)
+                return
+            logger.info(f"[{infohash_hex}] 元信息下载成功，大小: {len(metadata_bytes)} 字节。 "
+                        f"(Metainfo downloaded successfully, size: {len(metadata_bytes)} bytes.)")
+            metrics["metainfo_downloaded_success_total"] += 1 # 下载成功计数 (Increment download success count)
+            
+            logger.info(f"[{infohash_hex}] 正在存储元信息到 Elasticsearch... (Storing metainfo to Elasticsearch...)") # 修改日志级别为 INFO (Changed log level to INFO)
+            stored_successfully = es_loader.store_metainfo(infohash_bytes, metadata_bytes) 
+            if stored_successfully:
+                logger.info(f"[{infohash_hex}] 元信息成功存储到 Elasticsearch。 (Metainfo successfully stored in Elasticsearch.)")
+                metrics["metainfo_stored_es_total"] += 1 # 存储成功计数 (Increment storage success count)
+            else:
+                logger.warning(f"[{infohash_hex}] 元信息存储到 Elasticsearch 失败。 (Failed to store metainfo in Elasticsearch.)")
+
+        except Exception as e:
+            logger.error(f"处理 infohash {infohash_hex} 时发生错误: {e} "
+                         f"(Error processing infohash {infohash_hex}: {e})", exc_info=True)
+            metrics["metainfo_downloaded_failure_total"] += 1 # 将错误归类为下载失败 (Classify error as download failure)
+        finally:
+            metrics["active_download_tasks"] -= 1 # 减少活动任务计数 (Decrement active task count)
+            logger.debug(f"完成处理 infohash: {infohash_hex} (当前活动任务: {metrics['active_download_tasks']}) "
+                         f"(Finished processing for infohash: {infohash_hex} (current active tasks: {metrics['active_download_tasks']}))")
+
+
+async def main_crawler_loop(
+    dht_crawler: DHTCrawler,
+    downloader_peer_id: bytes, 
+    es_loader: ElasticsearchLoader,
+    semaphore: asyncio.Semaphore,
+    max_peers: int
+):
+    """
+    爬虫的主循环，从 DHT 队列中获取 infohashes 并为每个 infohash 创建处理任务。
+    (Main loop for the crawler, gets infohashes from DHT queue and creates processing tasks for each.)
+    """
+    global metrics # 引用全局指标字典 (Reference global metrics dictionary)
+    logger.info("爬虫主循环已启动。等待来自 DHT 爬虫的 infohashes... "
+                "(Crawler main loop started. Waiting for infohashes from DHT crawler...)")
+    pending_tasks = set() 
+
+    while not shutdown_event.is_set(): 
+        try:
+            infohash_bytes = await asyncio.wait_for(dht_crawler.infohash_queue.get(), timeout=1.0)
+            metrics["infohashes_discovered_total"] += 1 # 发现的 infohash 总数计数 (Increment total discovered infohashes count)
+            
+            task = asyncio.create_task(
+                process_infohash_task(
+                    infohash_bytes,
+                    dht_crawler,
+                    downloader_peer_id, 
+                    es_loader,
+                    semaphore,
+                    max_peers
+                )
+            )
+            pending_tasks.add(task) 
+            task.add_done_callback(pending_tasks.discard) 
+
+            dht_crawler.infohash_queue.task_done() 
+            logger.debug(f"当前待处理任务数: {len(pending_tasks)}, 活动下载: {metrics['active_download_tasks']} "
+                         f"(Current number of pending tasks: {len(pending_tasks)}, active downloads: {metrics['active_download_tasks']})")
+
+        except asyncio.TimeoutError:
+            continue 
+        except Exception as e:
+            logger.error(f"主循环遇到错误: {e} (Main loop encountered an error: {e})", exc_info=True)
+            await asyncio.sleep(1) 
+    
+    logger.info(f"关闭事件已设置。等待 {len(pending_tasks)} 个待处理任务完成... "
+                f"(Shutdown event set. Waiting for {len(pending_tasks)} pending tasks to complete...)")
+    if pending_tasks:
+        done, still_pending = await asyncio.wait(pending_tasks, timeout=30.0) 
+        if still_pending:
+            logger.warning(f"{len(still_pending)} 个任务在超时后仍未完成。将尝试取消它们。 "
+                           f"({len(still_pending)} tasks still pending after timeout. Attempting to cancel them.)")
+            for task_to_cancel in still_pending:
+                task_to_cancel.cancel() 
+            await asyncio.gather(*still_pending, return_exceptions=True) 
+    logger.info("所有待处理任务已处理完毕。 (All pending tasks have been processed.)")
+
+
+def handle_shutdown_signal(sig, loop):
+    """
+    处理关闭信号 (例如 SIGINT, SIGTERM)。
+    (Handle shutdown signals (e.g., SIGINT, SIGTERM).)
+    """
+    logger.info(f"收到信号 {sig}。正在启动优雅关闭... (Received signal {sig}. Initiating graceful shutdown...)")
+    shutdown_event.set() 
+
+async def main():
+    """
+    爬虫应用程序的主入口点。
+    (Main entry point for the crawler application.)
+    """
+    # 首先加载配置，包括日志配置 (First load configuration, including logging config)
+    full_config = load_crawler_config() 
+    crawler_cfg = full_config["crawler"]
+    logging_cfg = full_config["logging"]
+
+    # 基于配置设置日志记录 (Set up logging based on configuration)
+    setup_logging(log_level_str=logging_cfg.get("level", "INFO"), 
+                  log_file=logging_cfg.get("file_path"),
+                  log_format=DEFAULT_LOG_FORMAT) # 使用默认格式，或从配置加载 (Use default format, or load from config)
+
+    es_cfg = load_es_config()  # 这个函数也需要检查，以确保它不会覆盖日志设置
+                               # (This function also needs to be checked to ensure it doesn't override logging settings)
+                               # 或者，如果它也配置日志，则需要协调
+                               # (Or, if it also configures logging, it needs to be coordinated)
+                               # 当前 es_loader.py 中的 load_es_config 不配置全局日志，没问题
+                               # (Currently load_es_config in es_loader.py doesn't configure global logging, so it's fine)
+
+
+    if not es_cfg:
+        logger.critical("无法加载 Elasticsearch 配置。爬虫无法启动。 (Failed to load Elasticsearch configuration. Crawler cannot start.)")
+        return
+
+    client_downloader_peer_id = generate_peer_id()
+    infohash_discovered_queue = asyncio.Queue() 
+    dht_node_id = hashlib.sha1(os.urandom(20)).digest() 
+
+    dht_crawler = DHTCrawler(
+        infohash_queue=infohash_discovered_queue,
+        node_id=dht_node_id 
+    )
+    
+    try:
+        es_loader = ElasticsearchLoader(es_config=es_cfg)
+        if not await es_loader.es.ping(): # ping() 现在是异步的 (ping() is now async)
+             logger.warning("无法 ping通 Elasticsearch 服务器。请检查连接和服务器状态。 "
+                            "(Failed to ping Elasticsearch server. Please check connection and server status.)")
+    except Exception as e_init_es:
+        logger.critical(f"初始化 ElasticsearchLoader 失败: {e_init_es}。爬虫无法启动。 "
+                        f"(Failed to initialize ElasticsearchLoader: {e_init_es}. Crawler cannot start.)")
+        return
+
+    semaphore = asyncio.Semaphore(crawler_cfg["max_concurrent_downloads"])
+    loop = asyncio.get_running_loop() 
+    for sig_name in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig_name, handle_shutdown_signal, sig_name, loop)
+
+    # 启动定期指标日志记录任务 (Start periodic metrics logging task)
+    metrics_task = asyncio.create_task(log_metrics_periodically())
+
+    try:
+        await dht_crawler.start(port=crawler_cfg.get("dht_port", 6881)) 
+        
+        await main_crawler_loop(
+            dht_crawler,
+            client_downloader_peer_id, 
+            es_loader,
+            semaphore,
+            crawler_cfg["max_peers_per_infohash"]
+        )
+
+    except Exception as e:
+        logger.critical(f"爬虫主函数发生严重错误: {e} (Critical error in crawler main function: {e})", exc_info=True)
+    finally:
+        logger.info("正在关闭爬虫... (Shutting down crawler...)")
+        
+        # 触发关闭事件以停止指标日志记录循环和其他可能的循环
+        # (Trigger shutdown event to stop metrics logging loop and other possible loops)
+        shutdown_event.set() 
+        if metrics_task: # 等待指标任务完成 (Wait for metrics task to finish)
+            try:
+                await asyncio.wait_for(metrics_task, timeout=METRICS_LOG_INTERVAL + 1)
+            except asyncio.TimeoutError:
+                logger.warning("指标日志记录任务在关闭期间未及时完成。 (Metrics logging task did not finish in time during shutdown.)")
+            except asyncio.CancelledError: # 如果在 asyncio.run() 结束时被取消 (If cancelled at the end of asyncio.run())
+                pass
+
+
+        if dht_crawler.server and dht_crawler.server.protocol: 
+            await dht_crawler.stop() 
+        
+        # 记录最终指标 (Log final metrics)
+        final_metrics_log_message = ", ".join(f"{key}={value}" for key, value in metrics.items())
+        logger.info(f"最终爬虫指标: {final_metrics_log_message} (Final Crawler Metrics: {final_metrics_log_message})")
+
+
+        if hasattr(es_loader.es, 'close') and callable(es_loader.es.close):
+            try:
+                await es_loader.es.close() 
+                logger.info("Elasticsearch 连接已关闭。 (Elasticsearch connection closed.)")
+            except Exception as e_es_close:
+                logger.error(f"关闭 Elasticsearch 连接时出错: {e_es_close} "
+                             f"(Error closing Elasticsearch connection: {e_es_close})")
+        
+        logger.info("爬虫已关闭。 (Crawler shut down.)")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main()) 
+    except KeyboardInterrupt:
+        logger.info("用户请求关闭。 (Shutdown requested by user.)")
+    except Exception as e:
+        logger.critical(f"运行主爬虫时发生未处理的异常: {e} (Unhandled exception while running main crawler: {e})", exc_info=True)
+
+```python
+import asyncio
+import signal
+import logging
+import hashlib
+import os # 用于生成 peer_id (For generating peer_id)
+import binascii # 用于 infohash 的十六进制转换 (For hex conversion of infohash)
+import json # 用于加载配置 (For loading configuration)
+import time # 用于定期日志记录 (For periodic logging)
+
+from dht_crawler import DHTCrawler
+from metainfo_downloader import MetainfoDownloader
+from es_loader import ElasticsearchLoader, load_es_config as load_es_config_from_loader, DEFAULT_CONFIG_PATH
+
+# --- 日志配置开始 (Logging Configuration Start) ---
+# 默认日志格式 (Default log format)
+DEFAULT_LOG_FORMAT = '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
+# 获取根日志记录器 (Get the root logger)
+# 注意：在这里获取 logger 实例，以便在配置函数之前就可以使用它
+# (Note: Get the logger instance here so it can be used even before the config function)
+logger = logging.getLogger(__name__) # 获取此模块的日志记录器 (Get logger for this module)
+
+# 指标计数器 (Metric Counters)
+metrics = {
+    "infohashes_discovered_total": 0,
+    "metainfo_downloaded_success_total": 0,
+    "metainfo_downloaded_failure_total": 0,
+    "metainfo_stored_es_total": 0,
+    "active_download_tasks": 0 # 当前活动的下载任务数 (Current number of active download tasks)
+}
+# 上次记录指标的时间 (Time when metrics were last logged)
+last_metrics_log_time = time.monotonic()
+# 指标记录间隔（秒）(Metrics logging interval in seconds)
+METRICS_LOG_INTERVAL = 60 
+
+
+def setup_logging(log_level_str: str = "INFO", log_file: str | None = None, log_format: str = DEFAULT_LOG_FORMAT):
+    """
+    配置根日志记录器。
+    (Configure the root logger.)
+    Args:
+        log_level_str (str): 日志级别字符串 (e.g., "DEBUG", "INFO").
+                             (Log level string (e.g., "DEBUG", "INFO").)
+        log_file (str | None): 可选的日志文件路径。如果提供，日志将写入此文件。
+                               (Optional path to a log file. If provided, logs will be written to this file.)
+        log_format (str): 日志消息的格式。
+                          (Format for log messages.)
+    """
+    numeric_level = getattr(logging, log_level_str.upper(), logging.INFO)
+    
+    root_logger = logging.getLogger() 
+    root_logger.setLevel(numeric_level) 
+    
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+        handler.close()
+
+    formatter = logging.Formatter(log_format)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root_logger.addHandler(stream_handler) 
+    # 使用模块级 logger 记录初始配置信息 (Use module-level logger for initial config messages)
+    # 避免在 setup_logging 本身中使用 root_logger.info，因为它可能尚未完全配置
+    # (Avoid using root_logger.info within setup_logging itself as it might not be fully configured yet)
+    initial_config_logger = logging.getLogger(__name__)
+    initial_config_logger.info(f"控制台日志级别设置为: {log_level_str} (Console logging level set to: {log_level_str})")
+
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8') 
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler) 
+            initial_config_logger.info(f"文件日志级别设置为: {log_level_str}, 日志文件: {log_file} "
+                        f"(File logging level set to: {log_level_str}, log file: {log_file})")
+        except Exception as e:
+            initial_config_logger.error(f"设置文件日志处理器 '{log_file}' 失败: {e} "
+                         f"(Failed to set up file log handler '{log_file}': {e})")
+# --- 日志配置结束 (Logging Configuration End) ---
+
+
+# 全局变量，用于信号处理 (Global variable for signal handling)
+shutdown_event = asyncio.Event() 
+
+# 客户端标识和版本 (Client identifier and version)
+CLIENT_NAME = "MyCr" 
+CLIENT_VERSION = "0001" 
+
+def generate_peer_id() -> bytes:
+    """
+    生成一个符合 BitTorrent 规范的 peer_id。
+    (Generate a peer_id compliant with BitTorrent specifications.)
+    Returns:
+        bytes: 20 字节的 peer_id。 (20-byte peer_id.)
+    """
+    client_prefix = f"-{CLIENT_NAME[:2].upper()}{CLIENT_VERSION}-" 
+    random_bytes_len = 20 - len(client_prefix)
+    random_bytes = os.urandom(random_bytes_len) 
+    peer_id = client_prefix.encode('ascii') + random_bytes 
+    logger.info(f"生成的 peer_id (Latin-1): {peer_id.decode('latin-1')} (十六进制: {binascii.hexlify(peer_id).decode()}) "
+                f"(Generated peer_id (Latin-1): {peer_id.decode('latin-1')} (hex: {binascii.hexlify(peer_id).decode()}))")
+    return peer_id
+
+def load_main_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict: # 重命名以区分 (Renamed for clarity)
+    """
+    加载主配置文件，包含爬虫和日志配置。
+    (Load main configuration file, containing crawler and logging configurations.)
+    Args:
+        config_path (str): 配置文件的路径。 (Path to the configuration file.)
+    Returns:
+        dict: 包含所有配置的字典。 (Dictionary containing all configurations.)
+    """
+    default_cfg = {
+        "crawler": {
+            "max_concurrent_downloads": 5,
+            "max_peers_per_infohash": 30,
+            "dht_port": 6881
+        },
+        "logging": {
+            "level": "INFO",
+            "file_path": None 
+        }
+    }
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f) 
+            crawler_cfg = {**default_cfg["crawler"], **config.get("crawler", {})}
+            logging_cfg = {**default_cfg["logging"], **config.get("logging", {})}
+            
+            final_config = {"crawler": crawler_cfg, "logging": logging_cfg, "elasticsearch": config.get("elasticsearch", {})}
+            logger.info(f"成功从 '{config_path}' 加载配置: {final_config} "
+                        f"(Successfully loaded configuration from '{config_path}': {final_config})")
+            return final_config
+    except FileNotFoundError:
+        logger.warning(f"配置文件 '{config_path}' 未找到。使用所有默认值。 "
+                       f"(Configuration file '{config_path}' not found. Using all default values.)")
+    except json.JSONDecodeError:
+        logger.warning(f"解析配置文件 '{config_path}' 时出错。使用所有默认值。 "
+                       f"(Error parsing configuration file '{config_path}'. Using all default values.)")
+    except Exception as e:
+        logger.error(f"加载配置文件 '{config_path}' 时发生未知错误: {e}。使用所有默认值。 "
+                     f"(An unknown error occurred while loading configuration file '{config_path}': {e}. Using all default values.)")
+    return default_cfg
+
+
+async def log_metrics_periodically():
+    """
+    定期记录收集的指标。
+    (Periodically log collected metrics.)
+    """
+    global last_metrics_log_time
+    while not shutdown_event.is_set(): 
+        await asyncio.sleep(METRICS_LOG_INTERVAL) 
+        if shutdown_event.is_set():
+            break
+        
+        current_time = time.monotonic()
+        time_elapsed = current_time - last_metrics_log_time
+        
+        current_metrics_snapshot = metrics.copy()
+        # 添加路由表大小的特殊处理 (Add special handling for routing table size)
+        # 这假设 dht_crawler 实例在全局范围内可用，或者通过参数传递
+        # (This assumes dht_crawler instance is available globally or passed as an argument)
+        # 为了简单起见，我们暂时不直接从这里访问 dht_crawler
+        # (For simplicity, we won't access dht_crawler directly from here for now)
+        metrics_log_message = ", ".join(f"{key}={value}" for key, value in current_metrics_snapshot.items())
+        
+        logger.info(f"爬虫指标 (过去 {time_elapsed:.2f} 秒): {metrics_log_message} "
+                    f"(Crawler Metrics (last {time_elapsed:.2f}s): {metrics_log_message})")
+        last_metrics_log_time = current_time 
+
+async def process_infohash_task(
+    infohash_bytes: bytes,
+    dht_crawler_instance: DHTCrawler, # 明确传递 DHTCrawler 实例 (Explicitly pass DHTCrawler instance)
+    downloader_peer_id: bytes, 
+    es_loader_instance: ElasticsearchLoader, # 明确传递 ESLoader 实例 (Explicitly pass ESLoader instance)
+    semaphore: asyncio.Semaphore,
+    max_peers: int
+):
+    """
+    处理单个 infohash 的异步任务。
+    (Asynchronous task to process a single infohash.)
+    """
+    global metrics 
+    infohash_hex = binascii.hexlify(infohash_bytes).decode('utf-8') 
+    metainfo_downloader_session = MetainfoDownloader(infohash=infohash_bytes, peer_id=downloader_peer_id)
+
+    async with semaphore: 
+        metrics["active_download_tasks"] += 1 
+        try:
+            if shutdown_event.is_set(): 
+                logger.info(f"关闭事件已设置，跳过处理 infohash: {infohash_hex} "
+                            f"(Shutdown event is set, skipping processing for infohash: {infohash_hex})")
+                return
+
+            logger.info(f"开始处理 infohash: {infohash_hex} (当前活动任务: {metrics['active_download_tasks']}) "
+                        f"(Starting processing for infohash: {infohash_hex} (current active tasks: {metrics['active_download_tasks']}))")
+            
+            logger.info(f"[{infohash_hex}] 正在发现对等节点... (Discovering peers...)") # 修改日志级别 (Changed log level)
+            peers = await dht_crawler_instance.get_peers_for_infohash(infohash_bytes, max_peers)
+            if not peers:
+                logger.info(f"[{infohash_hex}] 未找到对等节点。 (No peers found.)")
+                metrics["metainfo_downloaded_failure_total"] += 1 
+                return
+            logger.info(f"[{infohash_hex}] 找到 {len(peers)} 个对等节点。 (Found {len(peers)} peers.)")
+
+            logger.info(f"[{infohash_hex}] 正在下载元信息... (Downloading metainfo...)")
+            metadata_bytes = await metainfo_downloader_session.download(peers) 
+
+            if not metadata_bytes:
+                logger.info(f"[{infohash_hex}] 元信息下载失败。 (Failed to download metainfo.)")
+                metrics["metainfo_downloaded_failure_total"] += 1 
+                return
+            logger.info(f"[{infohash_hex}] 元信息下载成功，大小: {len(metadata_bytes)} 字节。 "
+                        f"(Metainfo downloaded successfully, size: {len(metadata_bytes)} bytes.)")
+            metrics["metainfo_downloaded_success_total"] += 1 
+            
+            logger.info(f"[{infohash_hex}] 正在存储元信息到 Elasticsearch... (Storing metainfo to Elasticsearch...)")
+            stored_successfully = es_loader_instance.store_metainfo(infohash_bytes, metadata_bytes) 
+            if stored_successfully:
+                logger.info(f"[{infohash_hex}] 元信息成功存储到 Elasticsearch。 (Metainfo successfully stored in Elasticsearch.)")
+                metrics["metainfo_stored_es_total"] += 1 
+            else:
+                logger.warning(f"[{infohash_hex}] 元信息存储到 Elasticsearch 失败。 (Failed to store metainfo in Elasticsearch.)")
+
+        except Exception as e:
+            logger.error(f"处理 infohash {infohash_hex} 时发生错误: {e} "
+                         f"(Error processing infohash {infohash_hex}: {e})", exc_info=True)
+            metrics["metainfo_downloaded_failure_total"] += 1 
+        finally:
+            metrics["active_download_tasks"] -= 1 
+            logger.info(f"完成处理 infohash: {infohash_hex} (当前活动任务: {metrics['active_download_tasks']}) "
+                         f"(Finished processing for infohash: {infohash_hex} (current active tasks: {metrics['active_download_tasks']}))") # 修改日志级别 (Changed log level)
+
+
+async def main_crawler_loop(
+    dht_crawler_instance: DHTCrawler, # 明确传递实例 (Explicitly pass instance)
+    downloader_peer_id: bytes, 
+    es_loader_instance: ElasticsearchLoader, # 明确传递实例 (Explicitly pass instance)
+    semaphore: asyncio.Semaphore,
+    max_peers: int
+):
+    """
+    爬虫的主循环。
+    (Main loop for the crawler.)
+    """
+    global metrics 
+    logger.info("爬虫主循环已启动。等待来自 DHT 爬虫的 infohashes... "
+                "(Crawler main loop started. Waiting for infohashes from DHT crawler...)")
+    pending_tasks = set() 
+
+    while not shutdown_event.is_set(): 
+        try:
+            infohash_bytes = await asyncio.wait_for(dht_crawler_instance.infohash_queue.get(), timeout=1.0)
+            metrics["infohashes_discovered_total"] += 1 
+            
+            task = asyncio.create_task(
+                process_infohash_task(
+                    infohash_bytes,
+                    dht_crawler_instance, 
+                    downloader_peer_id, 
+                    es_loader_instance, 
+                    semaphore,
+                    max_peers
+                )
+            )
+            pending_tasks.add(task) 
+            task.add_done_callback(pending_tasks.discard) 
+
+            dht_crawler_instance.infohash_queue.task_done() 
+            logger.debug(f"当前待处理任务数: {len(pending_tasks)}, 活动下载: {metrics['active_download_tasks']} "
+                         f"(Current number of pending tasks: {len(pending_tasks)}, active downloads: {metrics['active_download_tasks']})")
+
+        except asyncio.TimeoutError:
+            continue 
+        except Exception as e:
+            logger.error(f"主循环遇到错误: {e} (Main loop encountered an error: {e})", exc_info=True)
+            await asyncio.sleep(1) 
+    
+    logger.info(f"关闭事件已设置。等待 {len(pending_tasks)} 个待处理任务完成... "
+                f"(Shutdown event set. Waiting for {len(pending_tasks)} pending tasks to complete...)")
+    if pending_tasks:
+        done, still_pending = await asyncio.wait(pending_tasks, timeout=30.0) 
+        if still_pending:
+            logger.warning(f"{len(still_pending)} 个任务在超时后仍未完成。将尝试取消它们。 "
+                           f"({len(still_pending)} tasks still pending after timeout. Attempting to cancel them.)")
+            for task_to_cancel in still_pending:
+                task_to_cancel.cancel() 
+            await asyncio.gather(*still_pending, return_exceptions=True) 
+    logger.info("所有待处理任务已处理完毕。 (All pending tasks have been processed.)")
+
+
+def handle_shutdown_signal(sig, loop):
+    """
+    处理关闭信号。
+    (Handle shutdown signals.)
+    """
+    logger.info(f"收到信号 {sig}。正在启动优雅关闭... (Received signal {sig}. Initiating graceful shutdown...)")
+    shutdown_event.set() 
+
+async def main():
+    """
+    爬虫应用程序的主入口点。
+    (Main entry point for the crawler application.)
+    """
+    # 加载主配置 (Load main configuration)
+    main_config = load_main_config() 
+    crawler_cfg = main_config["crawler"]
+    logging_cfg = main_config["logging"]
+    es_cfg = main_config["elasticsearch"] # 从主配置获取 ES 配置 (Get ES config from main config)
+
+    setup_logging(log_level_str=logging_cfg.get("level", "INFO"), 
+                  log_file=logging_cfg.get("file_path"),
+                  log_format=DEFAULT_LOG_FORMAT)
+
+    if not es_cfg or not es_cfg.get("host"): # 检查 ES 配置是否有效 (Check if ES config is valid)
+        logger.critical("Elasticsearch 配置无效或缺失。爬虫无法启动。 "
+                        "(Elasticsearch configuration is invalid or missing. Crawler cannot start.)")
+        return
+
+    client_downloader_peer_id = generate_peer_id()
+    infohash_discovered_queue = asyncio.Queue() 
+    dht_node_id = hashlib.sha1(os.urandom(20)).digest() 
+
+    dht_crawler = DHTCrawler(
+        infohash_queue=infohash_discovered_queue,
+        node_id=dht_node_id 
+    )
+    
+    es_loader = None # 在 try 块外声明 (Declare outside try block)
+    try:
+        es_loader = ElasticsearchLoader(es_config=es_cfg) # 使用从主配置加载的 es_cfg (Use es_cfg loaded from main config)
+        if not await es_loader.es.ping(): 
+             logger.warning("无法 ping通 Elasticsearch 服务器。请检查连接和服务器状态。 "
+                            "(Failed to ping Elasticsearch server. Please check connection and server status.)")
+    except Exception as e_init_es:
+        logger.critical(f"初始化 ElasticsearchLoader 失败: {e_init_es}。爬虫无法启动。 "
+                        f"(Failed to initialize ElasticsearchLoader: {e_init_es}. Crawler cannot start.)")
+        return
+
+    semaphore = asyncio.Semaphore(crawler_cfg["max_concurrent_downloads"])
+    loop = asyncio.get_running_loop() 
+    for sig_name in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig_name, handle_shutdown_signal, sig_name, loop)
+
+    metrics_task = asyncio.create_task(log_metrics_periodically())
+    # 将 DHTCrawler 实例传递给指标日志记录任务，以便它可以访问路由表大小
+    # (Pass DHTCrawler instance to metrics logging task so it can access routing table size)
+    # 这需要修改 log_metrics_periodically 以接受 dht_crawler 作为参数
+    # (This requires modifying log_metrics_periodically to accept dht_crawler as an argument)
+    # 为了简单起见，暂时不这样做，但这是一个可以改进的地方
+    # (For simplicity, not doing this for now, but it's an area for improvement)
+
+    try:
+        await dht_crawler.start(port=crawler_cfg.get("dht_port", 6881)) 
+        
+        await main_crawler_loop(
+            dht_crawler, # 传递 DHTCrawler 实例 (Pass DHTCrawler instance)
+            client_downloader_peer_id, 
+            es_loader, # 传递 ESLoader 实例 (Pass ESLoader instance)
+            semaphore,
+            crawler_cfg["max_peers_per_infohash"]
+        )
+
+    except Exception as e:
+        logger.critical(f"爬虫主函数发生严重错误: {e} (Critical error in crawler main function: {e})", exc_info=True)
+    finally:
+        logger.info("正在关闭爬虫... (Shutting down crawler...)")
+        
+        shutdown_event.set() 
+        if metrics_task and not metrics_task.done(): # 检查任务是否存在且未完成 (Check if task exists and is not done)
+            metrics_task.cancel() # 取消指标任务 (Cancel metrics task)
+            try:
+                await metrics_task # 等待取消完成 (Wait for cancellation to complete)
+            except asyncio.CancelledError:
+                logger.info("指标日志记录任务已取消。 (Metrics logging task cancelled.)")
+            except Exception as e_metric_cancel:
+                logger.error(f"取消指标任务时出错: {e_metric_cancel} (Error cancelling metrics task: {e_metric_cancel})")
+
+
+        if dht_crawler.server and dht_crawler.server.protocol: 
+            await dht_crawler.stop() 
+        
+        final_metrics_log_message = ", ".join(f"{key}={value}" for key, value in metrics.items())
+        logger.info(f"最终爬虫指标: {final_metrics_log_message} (Final Crawler Metrics: {final_metrics_log_message})")
+
+
+        if es_loader and hasattr(es_loader.es, 'close') and callable(es_loader.es.close): # 检查 es_loader 是否已初始化 (Check if es_loader was initialized)
+            try:
+                await es_loader.es.close() 
+                logger.info("Elasticsearch 连接已关闭。 (Elasticsearch connection closed.)")
+            except Exception as e_es_close:
+                logger.error(f"关闭 Elasticsearch 连接时出错: {e_es_close} "
+                             f"(Error closing Elasticsearch connection: {e_es_close})")
+        
+        logger.info("爬虫已关闭。 (Crawler shut down.)")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main()) 
+    except KeyboardInterrupt:
+        logger.info("用户请求关闭。 (Shutdown requested by user.)")
+    except Exception as e:
+        logger.critical(f"运行主爬虫时发生未处理的异常: {e} (Unhandled exception while running main crawler: {e})", exc_info=True)
+
+```

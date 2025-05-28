@@ -1,0 +1,15 @@
+# Elasticsearch client for Python
+elasticsearch==9.0.1
+elastic-transport==8.17.1
+
+# Kademlia DHT library (bmuller/kademlia)
+# Note: Version may vary depending on the specific fork or if installed directly from GitHub.
+# Check https://pypi.org/project/kademlia/ for available versions.
+kademlia>=1.5.0 
+
+# Bencoding and decoding library
+bencodepy==0.9.5
+
+# Python-dateutil is often a dependency for Elasticsearch or other libraries
+# Explicitly listing it if it was pulled in as a direct sub-dependency during ES install.
+python-dateutil==2.9.0.post0
