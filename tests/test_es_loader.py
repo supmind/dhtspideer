@@ -155,7 +155,10 @@ class TestElasticsearchLoader(unittest.TestCase):
         self.assertEqual(doc["name"], "My Test Torrent") # 验证名称 (Verify name)
         self.assertEqual(doc["length"], 1234567) # 验证长度 (Verify length)
         self.assertNotIn("files", doc) # 单文件种子不应有 'files' 字段 (Single-file torrent should not have 'files' field)
-        self.assertEqual(doc["comment"], "Test comment 中文") # 验证评论和中文解码 (Verify comment and Chinese decoding)
+        self.assertNotIn("comment", doc)
+        self.assertNotIn("announce", doc)
+        self.assertNotIn("private", doc)
+        self.assertNotIn("created_by", doc)
 
     def test_prepare_multi_file_torrent(self):
         # 测试准备多文件种子的文档 (Test preparing document for a multi-file torrent)
@@ -199,13 +202,21 @@ class TestElasticsearchLoader(unittest.TestCase):
         }
         doc = loader._prepare_document(self.sample_infohash_hex, complex_metainfo)
         self.assertIsNotNone(doc)
-        self.assertEqual(doc["announce"], "http://tracker.one/announce") # 验证 announce URL (Verify announce URL)
+        # Verify fields that should still be present
+        self.assertEqual(doc["name"], "Complex Torrent")
+        self.assertEqual(doc["length"], 5000)
         self.assertIsInstance(doc["announce_list"], list) # 断言 announce-list 是列表 (Assert announce-list is a list)
         self.assertIn({"url": "http://tracker.one/announce"}, doc["announce_list"]) # 验证 announce-list 内容 (Verify announce-list content)
         self.assertIn({"url": "udp://tracker.two/announce"}, doc["announce_list"])
         self.assertEqual(doc["creation_date"], datetime.datetime.fromtimestamp(now_ts, datetime.timezone.utc).isoformat()) # 验证创建日期 (Verify creation date)
-        self.assertTrue(doc["private"]) # 验证私有标志 (Verify private flag)
+        self.assertEqual(doc["encoding"], "UTF-8")
         self.assertEqual(doc["source"], "unit test source") # 验证来源 (Verify source)
+        
+        # Verify fields that should NOT be present
+        self.assertNotIn("comment", doc)
+        self.assertNotIn("announce", doc)
+        self.assertNotIn("private", doc)
+        self.assertNotIn("created_by", doc)
 
     def test_prepare_torrent_missing_info_dict(self):
         # 测试当 'info' 字典缺失时的处理 (Test handling when 'info' dictionary is missing)
