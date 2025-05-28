@@ -50,6 +50,7 @@ DHT 元信息爬虫是一个基于 Python 的应用程序，旨在爬取 BitTorr
 
 *   **Python**: 推荐使用 Python 3.8 或更高版本。
 *   **Elasticsearch**: 一个正在运行的 Elasticsearch 实例（应兼容 7.x 或 8.x 版本，客户端已用适用于 ES 8.x/9.x 的 Elasticsearch Python 客户端测试过）。
+*   **中文分词器 (Elasticsearch 插件)**: 为了获得最佳的中文内容搜索效果，建议在 Elasticsearch 中安装并配置中文分词插件（例如 [IK Analyzer](https://github.com/medcl/elasticsearch-analysis-ik)）。`es_mapping.py` 已配置为使用 `ik_smart` 分析器处理相关文本字段。
 *   **Pip**: 用于安装 Python 包。
 
 ## 设置与安装
@@ -66,6 +67,7 @@ DHT 元信息爬虫是一个基于 Python 的应用程序，旨在爬取 BitTorr
     ```bash
     python es_mapping.py
     ```
+    请注意：如果您希望启用并获得最佳的中文全文检索功能，请确保在运行 `python es_mapping.py` 之前，您的 Elasticsearch 服务已安装并正确配置了所选的中文分词插件（如 IK Analyzer）。`es_mapping.py` 文件中定义的映射依赖此插件进行中文分词。
     此脚本将尝试连接到 Elasticsearch（默认连接 `http://localhost:9200`，除非在脚本中修改了该地址）并创建索引。
 
 3.  **安装依赖**:

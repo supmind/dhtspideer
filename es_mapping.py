@@ -4,7 +4,7 @@ from elasticsearch.exceptions import ConnectionError
 
 # Define the mapping for the 'files' field (for multi-file torrents)
 class File(InnerDoc):
-    path = Text(required=True)
+    path = Text(required=True, analyzer='ik_smart')
     length = Long(required=True)
 
 # Define the mapping for the 'announce-list' field
@@ -14,17 +14,17 @@ class AnnounceURL(InnerDoc):
 # Define the main document mapping
 class TorrentMetainfo(Document):
     infohash = Keyword(required=True)
-    name = Text(required=True)
+    name = Text(required=True, analyzer='ik_smart')
     files = Nested(File)  # Optional, for multi-file torrents
     length = Long()  # Optional, for single-file torrents
     creation_date = Date()  # Optional
-    comment = Text()  # Optional
-    created_by = Text()  # Optional
+    comment = Text(analyzer='ik_smart')  # Optional
+    created_by = Text(analyzer='ik_smart')  # Optional
     encoding = Keyword()  # Optional
     announce = Keyword()  # Optional
     announce_list = Nested(AnnounceURL)  # Optional
     private = Boolean()  # Optional
-    source = Text()  # Optional
+    source = Text(analyzer='ik_smart')  # Optional
 
     class Index:
         name = 'torrent_metainfo'
