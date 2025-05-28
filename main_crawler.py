@@ -122,11 +122,23 @@ def load_main_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict: # 重命�
     }
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f) 
-            crawler_cfg = {**default_cfg["crawler"], **config.get("crawler", {})}
-            logging_cfg = {**default_cfg["logging"], **config.get("logging", {})}
+            config = json.load(f)
             
-            final_config = {"crawler": crawler_cfg, "logging": logging_cfg, "elasticsearch": config.get("elasticsearch", {})}
+            user_crawler_cfg = config.get("crawler", {})
+            user_logging_cfg = config.get("logging", {})
+            user_es_cfg = config.get("elasticsearch", {}) # ES config checked later in main()
+
+            if not isinstance(user_crawler_cfg, dict):
+                logger.warning("配置中的 'crawler' 部分不是一个字典对象，将仅使用默认爬虫配置。 (Configuration section 'crawler' is not a dictionary, using default crawler configurations only.)")
+                user_crawler_cfg = {}
+            if not isinstance(user_logging_cfg, dict):
+                logger.warning("配置中的 'logging' 部分不是一个字典对象，将仅使用默认日志配置。 (Configuration section 'logging' is not a dictionary, using default logging configurations only.)")
+                user_logging_cfg = {}
+
+            crawler_cfg = {**default_cfg["crawler"], **user_crawler_cfg}
+            logging_cfg = {**default_cfg["logging"], **user_logging_cfg}
+            
+            final_config = {"crawler": crawler_cfg, "logging": logging_cfg, "elasticsearch": user_es_cfg}
             logger.info(f"成功从 '{config_path}' 加载配置: {final_config} "
                         f"(Successfully loaded configuration from '{config_path}': {final_config})")
             return final_config
@@ -330,8 +342,9 @@ async def main():
     try:
         es_loader = ElasticsearchLoader(es_config=es_cfg) # 使用从主配置加载的 es_cfg (Use es_cfg loaded from main config)
         if not await es_loader.es.ping(): 
-             logger.warning("无法 ping通 Elasticsearch 服务器。请检查连接和服务器状态。 "
-                            "(Failed to ping Elasticsearch server. Please check connection and server status.)")
+             logger.critical("无法 ping通 Elasticsearch 服务器。请检查连接和服务器状态。爬虫将退出。 "
+                            "(Failed to ping Elasticsearch server. Please check connection and server status. Crawler will exit.)")
+             return
     except Exception as e_init_es:
         logger.critical(f"初始化 ElasticsearchLoader 失败: {e_init_es}。爬虫无法启动。 "
                         f"(Failed to initialize ElasticsearchLoader: {e_init_es}. Crawler cannot start.)")
