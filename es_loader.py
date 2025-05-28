@@ -169,18 +169,29 @@ class ElasticsearchLoader:
                 if isinstance(length, int):
                     doc['length'] = length
             
-            if b'creation date' in parsed_metainfo: 
+            if b'creation date' in parsed_metainfo:
                 creation_timestamp = parsed_metainfo.get(b'creation date')
                 if isinstance(creation_timestamp, int):
-                    doc['creation_date'] = datetime.datetime.fromtimestamp(creation_timestamp, tz=datetime.timezone.utc).isoformat()
+                    if creation_timestamp >= 0: # Check for non-negative
+                        try:
+                            doc['creation_date'] = datetime.datetime.fromtimestamp(creation_timestamp, tz=datetime.timezone.utc).isoformat()
+                        except OverflowError:
+                             logger.warning(f"[{infohash_hex}] 'creation date' 时间戳 {creation_timestamp} 过大无法转换。")
+                        except OSError: # e.g. on Windows, negative timestamps raise OSError
+                             logger.warning(f"[{infohash_hex}] 'creation date' 时间戳 {creation_timestamp} 无效 (例如为负数)。")
+                    else:
+                        logger.warning(f"[{infohash_hex}] 'creation date' 时间戳 {creation_timestamp} 为负数，已忽略。")
 
             doc['comment'] = parsed_metainfo.get(b'comment', b'').decode('utf-8', 'ignore')
             doc['created_by'] = parsed_metainfo.get(b'created by', b'').decode('utf-8', 'ignore')
             doc['encoding'] = parsed_metainfo.get(b'encoding', b'').decode('utf-8', 'ignore')
             
             announce_url = parsed_metainfo.get(b'announce')
-            if announce_url:
-                doc['announce'] = announce_url.decode('utf-8', 'ignore')
+            if announce_url: # Check if it exists first
+                 if isinstance(announce_url, bytes):
+                    doc['announce'] = announce_url.decode('utf-8', 'ignore')
+                 else:
+                    logger.warning(f"[{infohash_hex}] 'announce' URL 类型不正确: {type(announce_url)}。已忽略。")
             
             announce_list_raw = parsed_metainfo.get(b'announce-list')
             if isinstance(announce_list_raw, list):
