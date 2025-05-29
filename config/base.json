@@ -1,0 +1,45 @@
+{
+  "environment": "base_default",
+  "development_settings": {
+    "print_metainfo_details": false,
+    "store_in_es_dev_mode": false
+  },
+  "dht_crawler_config": {
+    "bootstrap_nodes": [
+      ["router.bittorrent.com", 6881],
+      ["dht.transmissionbt.com", 6881],
+      ["router.utorrent.com", 6881]
+    ],
+    "k_size": 20,
+    "alpha": 3,
+    "dht_port": 6881,
+    "node_id_source": "random",
+    "node_id_file_path": "node_id.bin"
+  },
+  "metainfo_downloader_config": {
+    "connect_timeout_seconds": 5,
+    "read_timeout_seconds": 10,
+    "piece_request_timeout_seconds": 15,
+    "max_metadata_size_mb": 5,
+    "max_concurrent_downloads": 10,
+    "max_peers_per_infohash": 50
+  },
+  "elasticsearch_config": {
+    "host": "localhost",
+    "port": 9200,
+    "scheme": "http",
+    "index_name": "torrent_metainfo_base",
+    "connection_timeout_seconds": 10,
+    "simulate_es_write": false
+  },
+  "logging_config": {
+    "level": "INFO",
+    "file_path": "dht_crawler_base.log"
+  },
+  "main_crawler_config": {
+    "metrics_log_interval_seconds": 60,
+    "client_name": "MyCr",
+    "client_version": "0001",
+    "shutdown_timeout_seconds": 30
+  }
+}

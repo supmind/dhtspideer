@@ -14,12 +14,7 @@ from kademlia.node import Node # 导入 Node 类以进行类型提示和使用 (
 # (Log level and handlers are configured by the main script (main_crawler.py))
 logger = logging.getLogger(__name__)
 
-# 默认引导节点 (Default bootstrap nodes)
-DEFAULT_BOOTSTRAP_NODES = [
-    ("router.bittorrent.com", 6881),
-    ("dht.transmissionbt.com", 6881),
-    ("router.utorrent.com", 6881)
-]
+# DEFAULT_BOOTSTRAP_NODES will be removed as it's now loaded from config.
 
 class InfohashQueueStorage(ForgetfulStorage):
     """
@@ -85,19 +80,23 @@ class DHTCrawler:
     BitTorrent DHT 网络的爬虫。
     (A crawler for the BitTorrent DHT network.)
     """
-    def __init__(self, bootstrap_nodes=None, infohash_queue=None, node_id=None):
-        if bootstrap_nodes is None:
-            bootstrap_nodes = DEFAULT_BOOTSTRAP_NODES
+    def __init__(self, infohash_queue, node_id=None, bootstrap_nodes=None, k_size=20, alpha=3):
         if infohash_queue is None:
             raise ValueError("infohash_queue (asyncio.Queue) 必须提供。 (infohash_queue (asyncio.Queue) must be provided.)")
-
-        self.bootstrap_nodes = bootstrap_nodes
+        
         self.infohash_queue = infohash_queue
-        self.server = None
-        self.node_id = node_id 
+        self.node_id = node_id
         self.custom_storage = InfohashQueueStorage(infohash_queue=self.infohash_queue)
-        logger.info(f"DHTCrawler 已初始化。节点 ID: {node_id.hex() if node_id else '自动生成'} "
-                    f"(DHTCrawler initialized. Node ID: {node_id.hex() if node_id else 'Auto-generated'})")
+        
+        self.k_size = k_size
+        self.alpha = alpha
+        self.bootstrap_nodes = bootstrap_nodes if bootstrap_nodes is not None else [] # Ensure it's a list
+
+        self.server = None
+        logger.info(
+            f"DHTCrawler 已初始化。节点 ID: {node_id.hex() if node_id else '自动生成'}, "
+            f"K: {self.k_size}, Alpha: {self.alpha}, Bootstrap Nodes: {self.bootstrap_nodes if self.bootstrap_nodes else '无 (None)'}"
+        )
 
     async def start(self, port=6881):
         """
@@ -107,15 +106,15 @@ class DHTCrawler:
         logger.info(f"正在启动 DHT 爬虫，端口为 {port}... (Starting DHT crawler on port {port}...)")
         try:
             self.server = Server(
-                ksize=20, 
-                alpha=3,  
+                ksize=self.k_size, 
+                alpha=self.alpha,  
                 id=self.node_id, 
                 storage=self.custom_storage 
             )
             await self.server.listen(port)
             logger.info(f"DHT 服务器已成功在端口 {port} 上监听。 (DHT server successfully listening on port {port}.)")
 
-            if self.bootstrap_nodes:
+            if self.bootstrap_nodes: # Check if list is not empty
                 logger.info(f"正在使用节点进行引导: {self.bootstrap_nodes} (Bootstrapping with nodes: {self.bootstrap_nodes})")
                 bootstrap_result = await self.server.bootstrap(self.bootstrap_nodes)
                 # 记录引导结果的摘要 (Log summary of bootstrap results)

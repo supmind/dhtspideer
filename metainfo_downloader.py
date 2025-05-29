@@ -15,18 +15,25 @@ PSTR = b"BitTorrent protocol"
 PSTRLEN = len(PSTR)
 RESERVED_BYTES = b'\x00\x00\x00\x00\x00\x10\x00\x00' 
 EXTENDED_MESSAGE_ID = 20 
-HANDSHAKE_LEN = 1 + PSTRLEN + 8 + 20 + 20 
-BLOCK_SIZE = 16 * 1024  # 16 KiB
-CONNECT_TIMEOUT = 5  
-READ_TIMEOUT = 10 
-PIECE_REQUEST_TIMEOUT = 15 
+# HANDSHAKE_LEN is not used directly, can be removed if not needed for other logic
+# HANDSHAKE_LEN = 1 + PSTRLEN + 8 + 20 + 20 
+BLOCK_SIZE = 16 * 1024  # 16 KiB - This can remain if it's a protocol constant not meant for config
+# Timeout constants will be removed and replaced by instance variables from config.
+# CONNECT_TIMEOUT = 5  
+# READ_TIMEOUT = 10 
+# PIECE_REQUEST_TIMEOUT = 15 
 
 class MetainfoDownloadError(Exception):
     """元信息下载失败的自定义异常。 (Custom exception for metainfo download failures.)"""
     pass
 
 class MetainfoDownloader:
-    def __init__(self, infohash: bytes, peer_id: bytes, loop: asyncio.AbstractEventLoop = None):
+    def __init__(self, infohash: bytes, peer_id: bytes, 
+                 connect_timeout_seconds: int = 5,
+                 read_timeout_seconds: int = 10,
+                 piece_request_timeout_seconds: int = 15,
+                 max_metadata_size_mb: int = 5,
+                 loop: asyncio.AbstractEventLoop = None):
         if len(infohash) != 20:
             raise ValueError("Infohash 必须为 20 字节长。 (Infohash must be 20 bytes long.)")
         if len(peer_id) != 20:
@@ -34,10 +41,18 @@ class MetainfoDownloader:
 
         self.infohash = infohash
         self.peer_id = peer_id
-        self.loop = loop or asyncio.get_event_loop() # 获取事件循环 (Get event loop)
-        # 初始化日志记录，包括 infohash (Log initialization including infohash)
-        logger.info(f"MetainfoDownloader 已为 infohash 初始化: {self.infohash.hex()} "
-                    f"(MetainfoDownloader initialized for infohash: {self.infohash.hex()})")
+        self.loop = loop or asyncio.get_event_loop()
+
+        self.connect_timeout_seconds = connect_timeout_seconds
+        self.read_timeout_seconds = read_timeout_seconds
+        self.piece_request_timeout_seconds = piece_request_timeout_seconds
+        self.max_metadata_size_bytes = max_metadata_size_mb * 1024 * 1024
+
+        logger.info(
+            f"MetainfoDownloader 已为 infohash 初始化: {self.infohash.hex()} "
+            f" timeouts(C/R/P): {self.connect_timeout_seconds}/{self.read_timeout_seconds}/{self.piece_request_timeout_seconds}s, "
+            f"max_size: {max_metadata_size_mb}MB"
+        )
 
     async def _connect_to_peer(self, peer_ip: str, peer_port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
         # 记录连接尝试，包括目标对等节点 (Log connection attempt including target peer)
@@ -45,13 +60,13 @@ class MetainfoDownloader:
                      f"(Attempting to connect to peer {peer_ip}:{peer_port})")
         try:
             future = asyncio.open_connection(peer_ip, peer_port)
-            reader, writer = await asyncio.wait_for(future, timeout=CONNECT_TIMEOUT)
+            reader, writer = await asyncio.wait_for(future, timeout=self.connect_timeout_seconds)
             logger.info(f"[{self.infohash.hex()}] 已成功连接到 {peer_ip}:{peer_port} "
                         f"(Successfully connected to {peer_ip}:{peer_port})")
             return reader, writer
         except asyncio.TimeoutError:
-            logger.warning(f"[{self.infohash.hex()}] 连接到 {peer_ip}:{peer_port} 超时。 "
-                           f"(Timeout connecting to {peer_ip}:{peer_port}.)")
+            logger.warning(f"[{self.infohash.hex()}] 连接到 {peer_ip}:{peer_port} 超时 ({self.connect_timeout_seconds}s)。 "
+                           f"(Timeout ({self.connect_timeout_seconds}s) connecting to {peer_ip}:{peer_port}.)")
         except ConnectionRefusedError:
             logger.warning(f"[{self.infohash.hex()}] {peer_ip}:{peer_port} 拒绝连接。 "
                            f"(Connection refused by {peer_ip}:{peer_port}.)")
@@ -78,31 +93,31 @@ class MetainfoDownloader:
         logger.debug(f"[{self.infohash.hex()}] 正在从 {peer_address} 接收 BitTorrent 握手... "
                      f"(Receiving BitTorrent handshake from {peer_address}...)")
         try:
-            resp_pstrlen_byte = await asyncio.wait_for(reader.readexactly(1), timeout=READ_TIMEOUT)
+            resp_pstrlen_byte = await asyncio.wait_for(reader.readexactly(1), timeout=self.read_timeout_seconds)
             resp_pstrlen = resp_pstrlen_byte[0]
             if resp_pstrlen != PSTRLEN:
                 logger.warning(f"[{self.infohash.hex()}] 对等节点 {peer_address} 返回了不正确的 pstrlen: {resp_pstrlen} "
                                f"(Peer {peer_address} returned incorrect pstrlen: {resp_pstrlen})")
                 return False
             
-            resp_pstr = await asyncio.wait_for(reader.readexactly(PSTRLEN), timeout=READ_TIMEOUT)
+            resp_pstr = await asyncio.wait_for(reader.readexactly(PSTRLEN), timeout=self.read_timeout_seconds)
             if resp_pstr != PSTR:
                 logger.warning(f"[{self.infohash.hex()}] 对等节点 {peer_address} 返回了不正确的 pstr: {resp_pstr!r} "
                                f"(Peer {peer_address} returned incorrect pstr: {resp_pstr!r})")
                 return False
 
-            resp_reserved = await asyncio.wait_for(reader.readexactly(8), timeout=READ_TIMEOUT)
+            resp_reserved = await asyncio.wait_for(reader.readexactly(8), timeout=self.read_timeout_seconds)
             if not (resp_reserved[5] & 0x10): 
                 logger.warning(f"[{self.infohash.hex()}] 对等节点 {peer_address} 不支持扩展消息 (BEP10)。保留字节: {resp_reserved.hex()} "
                                f"(Peer {peer_address} does not support extended messaging (BEP10). Reserved bytes: {resp_reserved.hex()})")
                 return False
             
-            resp_infohash = await asyncio.wait_for(reader.readexactly(20), timeout=READ_TIMEOUT)
+            resp_infohash = await asyncio.wait_for(reader.readexactly(20), timeout=self.read_timeout_seconds)
             if resp_infohash != self.infohash:
                 logger.warning(f"[{self.infohash.hex()}] 对等节点 {peer_address} 在握手中返回了不同的 infohash: {resp_infohash.hex()}。谨慎处理。 "
                                f"(Peer {peer_address} returned different infohash in handshake: {resp_infohash.hex()}. Proceeding cautiously.)")
 
-            resp_peer_id = await asyncio.wait_for(reader.readexactly(20), timeout=READ_TIMEOUT) 
+            resp_peer_id = await asyncio.wait_for(reader.readexactly(20), timeout=self.read_timeout_seconds) 
             logger.debug(f"[{self.infohash.hex()}] 从 {peer_address} 收到的对等节点 ID: {resp_peer_id.hex()} "
                          f"(Received peer ID from {peer_address}: {resp_peer_id.hex()})")
 
@@ -110,8 +125,8 @@ class MetainfoDownloader:
                         f"(BitTorrent handshake with {peer_address} successful.)")
             return True
         except asyncio.TimeoutError:
-            logger.warning(f"[{self.infohash.hex()}] 与 {peer_address} 进行 BitTorrent 握手超时。 "
-                           f"(Timeout during BitTorrent handshake with {peer_address}.)")
+            logger.warning(f"[{self.infohash.hex()}] 与 {peer_address} 进行 BitTorrent 握手超时 ({self.read_timeout_seconds}s)。 "
+                           f"(Timeout ({self.read_timeout_seconds}s) during BitTorrent handshake with {peer_address}.)")
         except asyncio.IncompleteReadError:
             logger.warning(f"[{self.infohash.hex()}] 与 {peer_address} 进行 BitTorrent 握手时读取不完整 (连接已关闭)。 "
                            f"(Incomplete read during BitTorrent handshake with {peer_address} (connection closed).)")
@@ -143,14 +158,14 @@ class MetainfoDownloader:
         try:
             logger.debug(f"[{self.infohash.hex()}] 等待来自 {peer_address} 的扩展握手响应... "
                          f"(Waiting for peer's extended handshake response from {peer_address}...)")
-            resp_len_bytes = await asyncio.wait_for(reader.readexactly(4), timeout=READ_TIMEOUT)
+            resp_len_bytes = await asyncio.wait_for(reader.readexactly(4), timeout=self.read_timeout_seconds)
             resp_len = struct.unpack('>I', resp_len_bytes)[0]
             if resp_len == 0: 
                 logger.warning(f"[{self.infohash.hex()}] 从 {peer_address} 收到长度为 0 的消息，可能为 keep-alive。 "
                                f"(Received message with length 0 from {peer_address} after extended handshake, might be keep-alive.)")
                 return None
 
-            resp_msg_id_byte = await asyncio.wait_for(reader.readexactly(1), timeout=READ_TIMEOUT)
+            resp_msg_id_byte = await asyncio.wait_for(reader.readexactly(1), timeout=self.read_timeout_seconds)
             resp_msg_id = resp_msg_id_byte[0]
 
             if resp_msg_id != EXTENDED_MESSAGE_ID:
@@ -164,7 +179,7 @@ class MetainfoDownloader:
                                f"(Invalid extended payload length {extended_payload_len} in extended handshake response from {peer_address}.)")
                 return None
 
-            resp_extended_msg_type_byte = await asyncio.wait_for(reader.readexactly(1), timeout=READ_TIMEOUT)
+            resp_extended_msg_type_byte = await asyncio.wait_for(reader.readexactly(1), timeout=self.read_timeout_seconds)
             if resp_extended_msg_type_byte[0] != 0: 
                  logger.warning(f"[{self.infohash.hex()}] 从 {peer_address} 期望扩展握手类型 0，但收到 {resp_extended_msg_type_byte[0]}。 "
                                 f"(Expected extended handshake type 0 in response from {peer_address}, got {resp_extended_msg_type_byte[0]}.)")
@@ -181,7 +196,7 @@ class MetainfoDownloader:
                                f"(Received empty extended handshake payload from {peer_address}, peer likely doesn't support ut_metadata properly.)")
                 return None
 
-            bencoded_payload_data = await asyncio.wait_for(reader.readexactly(bencoded_data_len), timeout=READ_TIMEOUT)
+            bencoded_payload_data = await asyncio.wait_for(reader.readexactly(bencoded_data_len), timeout=self.read_timeout_seconds)
             decoded_payload = bencodepy.decode(bencoded_payload_data)
             logger.debug(f"[{self.infohash.hex()}] 从 {peer_address} 收到的扩展握手解码后有效载荷: {decoded_payload} "
                          f"(Received extended handshake decoded payload from {peer_address}: {decoded_payload})")
@@ -209,8 +224,8 @@ class MetainfoDownloader:
             return ut_metadata_id, metadata_size
 
         except asyncio.TimeoutError:
-            logger.warning(f"[{self.infohash.hex()}] 与 {peer_address} 进行扩展握手超时。 "
-                           f"(Timeout during extended handshake with {peer_address}.)")
+            logger.warning(f"[{self.infohash.hex()}] 与 {peer_address} 进行扩展握手超时 ({self.read_timeout_seconds}s)。 "
+                           f"(Timeout ({self.read_timeout_seconds}s) during extended handshake with {peer_address}.)")
         except asyncio.IncompleteReadError:
             logger.warning(f"[{self.infohash.hex()}] 与 {peer_address} 进行扩展握手时读取不完整。 "
                            f"(Incomplete read during extended handshake with {peer_address}.)")
@@ -250,7 +265,7 @@ class MetainfoDownloader:
             await writer.drain()
 
             try:
-                resp_len_bytes = await asyncio.wait_for(reader.readexactly(4), timeout=PIECE_REQUEST_TIMEOUT)
+                resp_len_bytes = await asyncio.wait_for(reader.readexactly(4), timeout=self.piece_request_timeout_seconds)
                 resp_len = struct.unpack('>I', resp_len_bytes)[0]
                 if resp_len == 0: # Keep-alive
                     logger.debug(f"[{self.infohash.hex()}] 从 {peer_address} 收到 keep-alive 消息，正在请求块 {i}。 "
@@ -260,13 +275,13 @@ class MetainfoDownloader:
                     # (For simplicity, we continue, but this will fail if it leads to timeout)
                     continue 
 
-                resp_msg_id_byte = await asyncio.wait_for(reader.readexactly(1), timeout=READ_TIMEOUT)
+                resp_msg_id_byte = await asyncio.wait_for(reader.readexactly(1), timeout=self.read_timeout_seconds)
                 if resp_msg_id_byte[0] != EXTENDED_MESSAGE_ID:
                     logger.warning(f"[{self.infohash.hex()}] 从 {peer_address} 期望 EXTENDED_MESSAGE_ID (块 {i})，但收到 {resp_msg_id_byte[0]}。 "
                                    f"(Expected EXTENDED_MESSAGE_ID from {peer_address} for piece {i}, got {resp_msg_id_byte[0]}.)")
                     return None
 
-                resp_ut_metadata_id_byte = await asyncio.wait_for(reader.readexactly(1), timeout=READ_TIMEOUT)
+                resp_ut_metadata_id_byte = await asyncio.wait_for(reader.readexactly(1), timeout=self.read_timeout_seconds)
                 if resp_ut_metadata_id_byte[0] != peer_ut_metadata_id:
                     logger.warning(f"[{self.infohash.hex()}] 从 {peer_address} 期望对方的 ut_metadata_id {peer_ut_metadata_id} (块 {i})，但收到 {resp_ut_metadata_id_byte[0]}。 "
                                    f"(Expected peer's ut_metadata_id {peer_ut_metadata_id} from {peer_address} for piece {i}, got {resp_ut_metadata_id_byte[0]}.)")
@@ -278,7 +293,7 @@ class MetainfoDownloader:
                                    f"(Invalid bencoded_plus_data_len {bencoded_plus_data_len} for piece {i} from {peer_address}.)")
                     return None
                 
-                piece_payload_buffer = await asyncio.wait_for(reader.readexactly(bencoded_plus_data_len), timeout=READ_TIMEOUT)
+                piece_payload_buffer = await asyncio.wait_for(reader.readexactly(bencoded_plus_data_len), timeout=self.read_timeout_seconds)
                 
                 try:
                     decoded_piece_info, bencoded_part_len = bencodepy.decode_from_buffer(piece_payload_buffer)
@@ -313,8 +328,8 @@ class MetainfoDownloader:
                     return None
 
             except asyncio.TimeoutError:
-                logger.warning(f"[{self.infohash.hex()}] 从 {peer_address} 等待块 {i} 超时。 "
-                               f"(Timeout waiting for piece {i} from {peer_address}.)")
+                logger.warning(f"[{self.infohash.hex()}] 从 {peer_address} 等待块 {i} 超时 ({self.piece_request_timeout_seconds}s)。 "
+                               f"(Timeout ({self.piece_request_timeout_seconds}s) waiting for piece {i} from {peer_address}.)")
                 return None
             except asyncio.IncompleteReadError:
                 logger.warning(f"[{self.infohash.hex()}] 从 {peer_address} 读取块 {i} 时不完整 (连接已关闭)。 "
@@ -406,9 +421,9 @@ class MetainfoDownloader:
 
                 peer_ut_metadata_id, metadata_size = ext_handshake_result
                 
-                if metadata_size > 5 * 1024 * 1024: # 5MB 大小限制 (5MB size limit)
-                    logger.warning(f"[{self.infohash.hex()}] 对等节点 {peer_address_str} 报告的元信息大小 {metadata_size} 过大。跳过。 "
-                                   f"(Metadata size {metadata_size} reported by {peer_address_str} is too large. Skipping.)")
+                if metadata_size > self.max_metadata_size_bytes:
+                    logger.warning(f"[{self.infohash.hex()}] 对等节点 {peer_address_str} 报告的元信息大小 {metadata_size} 字节超过限制 ({self.max_metadata_size_bytes} 字节)。跳过。 "
+                                   f"(Metadata size {metadata_size} bytes reported by {peer_address_str} exceeds limit ({self.max_metadata_size_bytes} bytes). Skipping.)")
                     if writer and not writer.is_closing(): writer.close(); await writer.wait_closed()
                     continue
 

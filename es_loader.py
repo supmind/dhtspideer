@@ -11,90 +11,54 @@ import bencodepy
 # (Log level and handlers are configured by the main script (main_crawler.py))
 logger = logging.getLogger(__name__)
 
-# 默认配置文件路径 (Default configuration file path)
-DEFAULT_CONFIG_PATH = 'config.json'
-DEFAULT_ES_INDEX_NAME = 'torrent_metainfo'
-
-def load_es_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict | None:
-    """
-    加载 Elasticsearch 配置。
-    (Load Elasticsearch configuration.)
-    Args:
-        config_path (str): 配置文件的路径。 (Path to the configuration file.)
-    Returns:
-        dict | None: 包含 Elasticsearch 连接参数的字典，如果失败则返回 None。
-                      (Dictionary containing Elasticsearch connection parameters, or None if failed.)
-    """
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f) 
-            # logger.info(f"成功从 '{config_path}' 加载配置。 (Successfully loaded configuration from '{config_path}'.)") # 由主配置加载器处理 (Handled by main config loader)
-            return config.get("elasticsearch") 
-    except FileNotFoundError:
-        logger.error(f"配置文件 '{config_path}' 未找到。 (Configuration file '{config_path}' not found.)")
-        return None
-    except json.JSONDecodeError:
-        logger.error(f"解析配置文件 '{config_path}' 时出错。请检查 JSON 格式是否正确。 "
-                     f"(Error parsing configuration file '{config_path}'. Please check if the JSON format is correct.)")
-        return None
-    except Exception as e:
-        logger.error(f"加载配置文件 '{config_path}' 时发生未知错误: {e} "
-                     f"(An unknown error occurred while loading configuration file '{config_path}': {e})")
-        return None
+# DEFAULT_CONFIG_PATH and DEFAULT_ES_INDEX_NAME are removed as config is now fully externalized
+# and passed in. The load_es_config function is also removed.
 
 class ElasticsearchLoader:
     """
     一个用于将种子元信息存储到 Elasticsearch 中的类。
     (A class for storing torrent metainfo into Elasticsearch.)
     """
-    def __init__(self, es_config: dict | None = None):
+    def __init__(self, es_config: dict): # es_config is now mandatory
         """
         初始化 ElasticsearchLoader。
         (Initialize ElasticsearchLoader.)
         Args:
-            es_config (dict | None): Elasticsearch 连接配置。如果为 None，则尝试从默认路径加载。
-                                     (Elasticsearch connection configuration. If None, tries to load from default path.)
+            es_config (dict): Elasticsearch 连接配置。
+                                     (Elasticsearch connection configuration.)
         """
-        if es_config is None:
-            # 尝试加载 Elasticsearch 特定配置 (Try to load Elasticsearch specific configuration)
-            # 注意：主爬虫现在处理组合的配置加载 (Note: main crawler now handles combined config loading)
-            # 这个函数可能不会被直接调用，除非独立使用 es_loader
-            # (This function might not be called directly unless es_loader is used standalone)
-            es_cfg_loaded = load_es_config() 
-            if not es_cfg_loaded: # 如果特定加载失败 (If specific loading fails)
-                 raise ValueError("Elasticsearch 配置未提供且无法从默认路径加载。 "
-                                  "(Elasticsearch configuration not provided and failed to load from default path.)")
-            current_es_config = es_cfg_loaded
-        else:
-            current_es_config = es_config
+        if not es_config:
+            raise ValueError("Elasticsearch 配置 (es_config) 必须提供。 (Elasticsearch configuration (es_config) must be provided.)")
 
+        # Validate required keys more robustly
+        required_keys = ["host", "port", "index_name", "connection_timeout_seconds"]
+        missing_keys = [key for key in required_keys if key not in es_config]
+        if missing_keys:
+            msg = f"Elasticsearch 配置缺少必需的键: {', '.join(missing_keys)} (Elasticsearch configuration is missing required keys: {', '.join(missing_keys)})"
+            logger.error(msg)
+            raise ValueError(msg)
 
-        if not current_es_config or not all(k in current_es_config for k in ["host", "port"]):
-            logger.error("Elasticsearch 配置无效或不完整。请提供主机和端口。 "
-                         "(Elasticsearch configuration is invalid or incomplete. Please provide host and port.)")
-            raise ValueError("Elasticsearch 配置无效或不完整。 (Elasticsearch configuration is invalid or incomplete.)")
-
-        es_scheme = current_es_config.get("scheme", "http") 
-        es_host = current_es_config["host"]
-        es_port = current_es_config["port"]
+        es_scheme = es_config.get("scheme", "http") 
+        es_host = es_config["host"]
+        es_port = es_config["port"]
+        self.index_name = es_config["index_name"]
+        connection_timeout = es_config["connection_timeout_seconds"]
         
-        self.simulate_es_write = current_es_config.get("simulate_es_write", False) # Default to False
+        self.simulate_es_write = es_config.get("simulate_es_write", False)
         logger.info(f"Elasticsearch simulate_es_write mode: {self.simulate_es_write}")
+        logger.info(f"Elasticsearch index name: {self.index_name}")
+        logger.info(f"Elasticsearch connection timeout: {connection_timeout}s")
 
-        self.connection_string = f"{es_scheme}://{es_host}:{es_port}" # 存储连接字符串以供日志记录 (Store connection string for logging)
+
+        self.connection_string = f"{es_scheme}://{es_host}:{es_port}"
         try:
-            # 根据 Elasticsearch 客户端版本，ping 方法可能是异步的
-            # (Depending on Elasticsearch client version, ping method might be async)
-            # 当前实现假设它是同步的，或者在异步上下文中正确处理
-            # (Current implementation assumes it's synchronous or handled correctly in async context)
-            # 对于 >=8.x, es.ping() 是同步的，但如果与 async loop 一起使用，则应使用 await es.ping()
-            # (For >=8.x, es.ping() is synchronous, but if used with an async loop, await es.ping() should be used)
-            # 在 main_crawler.py 中，我们 await es.ping()
-            # (In main_crawler.py, we await es.ping())
-            self.es = Elasticsearch([self.connection_string], timeout=10) 
-            logger.info(f"ElasticsearchLoader 初始化，目标: {self.connection_string} "
-                        f"(ElasticsearchLoader initialized, targeting: {self.connection_string})")
-            # Ping 操作移至主爬虫的初始化逻辑中 (Ping operation moved to main crawler's init logic)
+            self.es = Elasticsearch(
+                [self.connection_string], 
+                timeout=connection_timeout # Use configured timeout
+            )
+            logger.info(f"ElasticsearchLoader 初始化，目标: {self.connection_string}, 索引: {self.index_name} "
+                        f"(ElasticsearchLoader initialized, targeting: {self.connection_string}, index: {self.index_name})")
+            # Ping operation is handled in main_crawler.py after initialization.
         except es_exceptions.ConnectionError as e:
             logger.error(f"连接到 Elasticsearch ({self.connection_string}) 失败: {e} "
                          f"(Failed to connect to Elasticsearch ({self.connection_string}): {e})")
@@ -252,7 +216,7 @@ class ElasticsearchLoader:
 
         try:
             response = self.es.index(
-                index=DEFAULT_ES_INDEX_NAME,
+                index=self.index_name, # Use configured index name
                 id=infohash_hex,
                 document=document_to_store
             )
@@ -267,11 +231,11 @@ class ElasticsearchLoader:
             logger.error(f"[{infohash_hex}] 存储时发生 Elasticsearch 传输错误: {e} (status: {e.status_code}) "
                          f"(Elasticsearch transport error occurred while storing {infohash_hex}: {e} (status: {e.status_code}))")
             if e.status_code == 404: 
-                logger.error(f"[{infohash_hex}] 错误详情: 索引 '{DEFAULT_ES_INDEX_NAME}' 可能不存在。 "
-                             f"(Error details for {infohash_hex}: Index '{DEFAULT_ES_INDEX_NAME}' might not exist.)")
+                logger.error(f"[{infohash_hex}] 错误详情: 索引 '{self.index_name}' 可能不存在。 "
+                             f"(Error details for {infohash_hex}: Index '{self.index_name}' might not exist.)")
             elif e.status_code == 400: 
-                 logger.error(f"[{infohash_hex}] 错误详情: 文档可能与索引 '{DEFAULT_ES_INDEX_NAME}' 的映射不匹配。错误: {e.info} "
-                              f"(Error details for {infohash_hex}: Document might not match mapping of index '{DEFAULT_ES_INDEX_NAME}'. Error: {e.info})")
+                 logger.error(f"[{infohash_hex}] 错误详情: 文档可能与索引 '{self.index_name}' 的映射不匹配。错误: {e.info} "
+                              f"(Error details for {infohash_hex}: Document might not match mapping of index '{self.index_name}'. Error: {e.info})")
         except es_exceptions.ElasticsearchException as e:
             logger.error(f"[{infohash_hex}] 存储时发生 Elasticsearch 错误: {e} "
                          f"(Elasticsearch error occurred while storing {infohash_hex}: {e})", exc_info=True)
